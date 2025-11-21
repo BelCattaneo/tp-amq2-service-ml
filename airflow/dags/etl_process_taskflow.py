@@ -41,35 +41,42 @@ def process_etl_taskflow():
 
     @task.python
     def download_data(**context):
-        """Download crime data and police stations from Socrata API."""
+        """Download crime data - full year on first run, incremental on subsequent runs."""
         bucket_name = os.getenv('DATA_REPO_BUCKET_NAME', 'data')
 
-        # Determine month folder from execution date
+        # Check if this is first run (no existing merged files)
+        merged_prefix = '0-raw-data/data/crimes_12m_'
+        existing_merged = list_objects(bucket_name, prefix=merged_prefix)
+        is_first_run = len(existing_merged) == 0
+
         start_date = context['data_interval_start']
+        end_date = context['data_interval_end']
         month_folder = start_date.strftime('%Y-%m')
 
         crimes_temp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
         stations_temp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
 
         try:
-            print(f"Downloading data for month: {month_folder}")
+            if is_first_run:
+                print("First run detected: downloading full year of data")
+                crimes_df = download_crimes_full(output_file=crimes_temp.name)
+                crimes_key = f"0-raw-data/monthly-data/{month_folder}/crimes_full.csv"
+            else:
+                print(f"Incremental run: downloading data for month {month_folder}")
+                crimes_df = download_crimes_incremental(start_date, end_date, output_file=crimes_temp.name)
 
-            # Download crime data for the month
-            end_date = context['data_interval_end']
-            crimes_df = download_crimes_incremental(start_date, end_date, output_file=crimes_temp.name)
+                if len(crimes_df) == 0:
+                    print("No new crime data found for this period")
+                    return {'status': 'no_data', 'records': 0}
 
-            if len(crimes_df) == 0:
-                print("No new crime data found")
-                return {'status': 'no_data', 'records': 0}
+                crimes_key = f"0-raw-data/monthly-data/{month_folder}/crimes.csv"
 
             # Download police stations
             print("Downloading police stations data")
             stations_df = download_police_stations(output_file=stations_temp.name)
-
-            # Upload to MinIO
-            crimes_key = f"0-raw-data/monthly-data/{month_folder}/crimes.csv"
             stations_key = f"0-raw-data/monthly-data/{month_folder}/police_stations.csv"
 
+            # Upload to MinIO
             upload_to_minio(crimes_temp.name, bucket_name, crimes_key)
             upload_to_minio(stations_temp.name, bucket_name, stations_key)
 
@@ -78,6 +85,7 @@ def process_etl_taskflow():
 
             return {
                 'status': 'success',
+                'is_first_run': is_first_run,
                 'month_folder': month_folder,
                 'crimes_file': crimes_key,
                 'stations_file': stations_key,
@@ -92,39 +100,39 @@ def process_etl_taskflow():
 
     @task.python
     def merge_data(download_result):
-        """Merge new monthly data into rolling 12-month window."""
+        """Merge downloaded data into rolling 12-month window."""
         if download_result.get('status') == 'no_data':
             print("No data to merge")
             return {'status': 'no_data'}
 
         bucket_name = os.getenv('DATA_REPO_BUCKET_NAME', 'data')
         run_date = datetime.datetime.now().strftime('%Y-%m-%d')
-
-        # Check if merged file already exists
-        merged_prefix = '0-raw-data/data/crimes_12m_'
-        existing_merged = list_objects(bucket_name, prefix=merged_prefix)
-        is_first_run = len(existing_merged) == 0
+        is_first_run = download_result.get('is_first_run', False)
 
         merged_temp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
-        monthly_temp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+        new_data_temp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
 
         try:
+            # Load newly downloaded data
+            crimes_key = download_result['crimes_file']
+            print(f"Loading downloaded data: {crimes_key}")
+            download_from_minio(bucket_name, crimes_key, new_data_temp.name)
+            df_new = pd.read_csv(new_data_temp.name)
+
             if is_first_run:
-                print("First run: downloading full year of data for initial merge")
-                merged_df = download_crimes_full(output_file=merged_temp.name)
+                # First run: use the full year download as-is
+                print(f"First run: using full year data as initial merged dataset")
+                merged_df = df_new
                 print(f"Initial dataset: {len(merged_df)} records")
             else:
-                # Load latest merged file
+                # Subsequent runs: merge with existing data
+                merged_prefix = '0-raw-data/data/crimes_12m_'
+                existing_merged = list_objects(bucket_name, prefix=merged_prefix)
                 latest_merged = sorted(existing_merged)[-1]
+
                 print(f"Loading latest merged file: {latest_merged}")
                 download_from_minio(bucket_name, latest_merged, merged_temp.name)
                 df_existing = pd.read_csv(merged_temp.name)
-
-                # Load new monthly data
-                monthly_key = download_result['crimes_file']
-                print(f"Loading new monthly data: {monthly_key}")
-                download_from_minio(bucket_name, monthly_key, monthly_temp.name)
-                df_new = pd.read_csv(monthly_temp.name)
 
                 # Concatenate
                 print(f"Merging: {len(df_existing)} existing + {len(df_new)} new records")
@@ -152,8 +160,8 @@ def process_etl_taskflow():
         finally:
             if os.path.exists(merged_temp.name):
                 os.remove(merged_temp.name)
-            if os.path.exists(monthly_temp.name):
-                os.remove(monthly_temp.name)
+            if os.path.exists(new_data_temp.name):
+                os.remove(new_data_temp.name)
 
     @task.python
     def enrich_data(merge_result, download_result):
