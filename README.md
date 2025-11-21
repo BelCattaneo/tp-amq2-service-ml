@@ -2,6 +2,8 @@
 ### MLOps1 - CEIA - FIUBA
 Estructura de servicios para la implementación del proyecto final de MLOps1 - CEIA - FIUBA
 
+> **Nota:** Las consignas del trabajo práctico se encuentran en [CONSIGNAS.md](CONSIGNAS.md)
+
 Supongamos que trabajamos para **ML Models and something more Inc.**, la cual ofrece un servicio que proporciona modelos mediante una REST API. Internamente, tanto para realizar tareas de DataOps como de MLOps, la empresa cuenta con varios servicios que ayudan a ejecutar las acciones necesarias. También dispone de un Data Lake en S3, para este caso, simularemos un S3 utilizando MinIO.
 
 Para simular esta empresa, utilizaremos Docker y, a través de Docker Compose, desplegaremos varios contenedores que representan distintos servicios en un entorno productivo.
@@ -26,30 +28,19 @@ y las siguientes bases de datos:
 - `mlflow_db` (usada por MLflow).
 - `airflow` (usada por Airflow).
 
-## Tarea a realizar
-
-La tarea es implementar el modelo que desarrollaron en Aprendizaje de Máquina en este ambiente productivo. Para ello, pueden usar y crear los buckets y bases de datos que necesiten. Lo mínimo que deben realizar es:
-
-- Un DAG en Apache Airflow. Puede ser cualquier tarea que se desee realizar, como entrenar el modelo, un proceso ETL, etc.
-- Un experimento en MLflow de búsqueda de hiperparámetros.
-- Servir el modelo implementado en AMq1 en el servicio de RESTAPI.
-- Documentar (comentarios y docstring en scripts, notebooks, y asegurar que la documentación de FastAPI esté de acuerdo al modelo).
-
-Desde **ML Models and something more Inc.** autorizan a extender los requisitos mínimos. También pueden utilizar nuevos servicios (por ejemplo, una base de datos no relacional, otro orquestador como MetaFlow, un servicio de API mediante NodeJs, etc.).
-
-### Ejemplo 
-
-El [branch `example_implementation`](https://github.com/facundolucianna/amq2-service-ml/tree/example_implementation) contiene un ejemplo de aplicación para guiarse. Se trata de una implementación de un modelo de clasificación utilizando los datos de [Heart Disease](https://archive.ics.uci.edu/dataset/45/heart+disease).
-
-Además se cuenta con una implementación ejemplo de predicción en bache con una parte que funciona gran parte de local en [branch `batch-example`](https://github.com/facundolucianna/amq2-service-ml/tree/example_implementation)
-
 ## Instalación
 
 1. Para poder levantar todos los servicios, primero instala [Docker](https://docs.docker.com/engine/install/) en tu computadora (o en el servidor que desees usar).
 2. Clona este repositorio.
-3. Crea las carpetas `airflow/config`, `airflow/dags`, `airflow/logs`, `airflow/plugins`, `airflow/logs`.
+3. Crea las carpetas `airflow/config`, `airflow/dags`, `airflow/logs`, `airflow/plugins`.
 4. Si estás en Linux o MacOS, en el archivo `.env`, reemplaza `AIRFLOW_UID` por el de tu usuario o alguno que consideres oportuno (para encontrar el UID, usa el comando `id -u <username>`). De lo contrario, Airflow dejará sus carpetas internas como root y no podrás subir DAGs (en `airflow/dags`) o plugins, etc.
 5. En la carpeta raíz de este repositorio, ejecuta:
+
+```bash
+make install && make up
+```
+
+O usando docker-compose directamente:
 
 ```bash
 docker compose --profile all up
@@ -66,21 +57,179 @@ Si estás usando un servidor externo a tu computadora de trabajo, reemplaza `loc
 
 Todos los puertos u otras configuraciones se pueden modificar en el archivo `.env`. Se invita a jugar y romper para aprender; siempre puedes volver a clonar este repositorio.
 
+## Comandos disponibles (Makefile)
+
+El proyecto incluye un Makefile con comandos útiles para gestionar los servicios:
+
+```bash
+make help      # Muestra todos los comandos disponibles
+make up        # Inicia todos los servicios
+make down      # Detiene todos los servicios
+make restart   # Reinicia todos los servicios
+make install   # Reconstruye contenedores con nuevas dependencias
+make clean     # Detiene y elimina todo (contenedores, redes y volúmenes)
+make logs      # Muestra logs de todos los servicios en tiempo real
+make status    # Muestra el estado de todos los servicios
+```
+
+### Flujo de trabajo común
+
+**Primera vez:**
+```bash
+make install && make up
+```
+
+**Después de agregar dependencias en `requirements.txt`:**
+```bash
+make install
+```
+
+**Reiniciar desde cero:**
+```bash
+make clean
+make install && make up
+```
+
+## ETL Pipeline: Chicago Crime Data
+
+El proyecto incluye un pipeline ETL completo para análisis de crímenes en Chicago:
+
+### Arquitectura del Pipeline
+
+**Task 1: setup_s3**
+- Crea bucket MinIO si no existe
+- Configura política de lifecycle (TTL de 60 días para datos temporales)
+
+**Task 2: download_data**
+- Descarga datos de crímenes desde Socrata API (Chicago Data Portal)
+- Descarga datos de estaciones policiales
+- Primera ejecución: descarga año completo (~260k registros)
+- Ejecuciones subsecuentes: descarga incremental mensual (~25k registros)
+- Guarda en MinIO: `raw-data/crimes_YYYY-MM-DD.csv` y `raw-data/police_stations.csv`
+
+**Task 3: enrich_data**
+- Carga datos desde MinIO
+- Calcula distancia a estación policial más cercana (GeoPandas spatial join)
+- Crea features temporales:
+  - Season (Winter/Spring/Summer/Fall)
+  - Day of week (0-6)
+  - Day time (Morning/Afternoon/Evening/Night)
+- Guarda en MinIO: `raw-data/crimes_enriched_YYYY-MM-DD.csv`
+
+**Tasks 4-8:** (Por implementar)
+- `split_data` - División train/test (80/20 estratificado)
+- `process_outliers` - Manejo de outliers y transformación logarítmica
+- `encode_data` - Encoding de variables categóricas
+- `scale_data` - Escalado con StandardScaler
+- `balance_data` - Balanceo con SMOTE + RandomUnderSampler
+- `extract_features` - Selección de features con Mutual Information
+
+### Estructura de Módulos
+
+```
+airflow/dags/
+├── etl_process_taskflow.py       # DAG principal con TaskFlow API
+└── etl_helpers/
+    ├── __init__.py               # Package initialization
+    ├── minio_utils.py            # Operaciones MinIO/S3
+    ├── data_loader.py            # Descarga desde Socrata API
+    └── data_enrichment.py        # Enriquecimiento geoespacial y temporal
+```
+
+### Configuración
+
+**Variables de entorno requeridas (`.env`):**
+```bash
+SOCRATA_APP_TOKEN=tu_token_aqui  # Token de Socrata API
+DATA_REPO_BUCKET_NAME=data        # Bucket MinIO para datos
+```
+
+**Dependencias principales:**
+- `sodapy` - Cliente Socrata API
+- `geopandas` - Cálculos geoespaciales
+- `shapely` - Geometrías
+- `pandas` - Manipulación de datos
+
+### Ejecución
+
+**Trigger manual:**
+1. Abrir Airflow UI: `make airflow`
+2. Localizar DAG: `etl_with_taskflow`
+3. Click en "Play" para ejecutar
+
+**Ejecución automática:**
+- Schedule: `@monthly` (primer día de cada mes)
+- Primera ejecución: descarga año completo
+- Subsecuentes: solo último mes
+
+### Monitoreo
+
+**Ver logs:**
+```bash
+make logs                    # Todos los servicios
+docker logs -f <container>   # Servicio específico
+```
+
+**Ver estado:**
+```bash
+make status
+```
+
+**Acceder a UIs:**
+```bash
+make airflow   # Ver DAG runs y logs
+make minio     # Ver archivos en buckets
+```
+
+### Datos de Salida
+
+**Ubicación:** MinIO bucket `data/`
+
+**Estructura:**
+```
+data/
+├── 0-raw-data/
+│   ├── monthly-data/
+│   │   └── {YYYY-MM}/
+│   │       ├── crimes.csv              # Crímenes descargados del mes
+│   │       └── police_stations.csv     # Estaciones policiales
+│   └── data/
+│       └── crimes_12m_{YYYY-MM-DD}.csv # Ventana rolling 12 meses
+├── 1-enriched-data/
+│   └── crimes_enriched_{YYYY-MM-DD}.csv # Crímenes enriquecidos
+└── 2-processed-data/                    # (Próximos pasos)
+    ├── train_encoded.csv
+    ├── test_encoded.csv
+    └── ...
+```
+
 ## Apagar los servicios
 
-Estos servicios ocupan cierta cantidad de memoria RAM y procesamiento, por lo que cuando no se están utilizando, se recomienda detenerlos. Para hacerlo, ejecuta el siguiente comando:
+Estos servicios ocupan cierta cantidad de memoria RAM y procesamiento, por lo que cuando no se están utilizando, se recomienda detenerlos. Para hacerlo, ejecuta:
+
+```bash
+make down
+```
+
+O usando docker-compose directamente:
 
 ```bash
 docker compose --profile all down
 ```
 
-Si deseas no solo detenerlos, sino también eliminar toda la infraestructura (liberando espacio en disco), utiliza el siguiente comando:
+Si deseas no solo detenerlos, sino también eliminar toda la infraestructura (liberando espacio en disco):
+
+```bash
+make clean
+```
+
+O usando docker-compose directamente:
 
 ```bash
 docker compose down --rmi all --volumes
 ```
 
-Nota: Si haces esto, perderás todo en los buckets y bases de datos.
+**Nota:** Si haces esto, perderás todo en los buckets y bases de datos.
 
 ## Aspectos específicos de Airflow
 
